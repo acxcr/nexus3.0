@@ -1,16 +1,17 @@
 #!/bin/bash
 #
-# 脚本名称: nexus_3.2_final.sh
-# 描述: Nexus Pro 节点管理脚本 v3.2 (融合版)
+# 脚本名称: nexus3.0.sh
+# 描述: Nexus Pro 节点管理脚本 v3.0 (专业版)
 #
 # --- 特性 ---
-# 1. 实例组轮换模型: 无限ID池, 每组一个活动实例。
-# 2. 定时轮换: 通过 Cron 实现每2小时自动轮换。
-# 3. 双重日志管理:
-#    - 轮换时销毁日志，确保每个ID周期日志独立。
-#    - 运行时每5分钟清空日志，方便实时“动画式”查看。
-# 4. 高级控制: 精细到单个实例的重启/轮换，以及自动轮换总开关。
-# 5. 健壮性: 依赖自动安装，终端状态恢复，配置备份与恢复。
+# 1. 镜像名称统一为 nexus:3.0。
+# 2. 移除所有操作性[Y/N]确认，实现“即点即生效”。
+# 3. 实例组轮换模型: 无限ID池, 每组一个活动ID。
+# 4. 定时轮换: 通过 Cron 实现每2小时自动轮换。
+# 5. 统一日志清理: 任何启动/重启皆清空日志，且运行时每5分钟刷新。
+# 6. 终极终端修复: 通过发送原始指令码解决顽固的终端劫持问题。
+# 7. 周期计时器: 在控制中心显示 HH:MM:SS 格式的当前周期运行时长。
+# 8. 精准卸载: 卸载时只清理与本项目相关的数据。
 #
 
 # --- 安全设置：任何命令失败则立即退出 ---
@@ -18,9 +19,9 @@ set -e
 
 # --- 全局变量定义 ---
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-MAIN_DIR="$SCRIPT_DIR/nexus3.2"
+MAIN_DIR="$SCRIPT_DIR/nexus3.0"
 CONFIG_FILE="$MAIN_DIR/nexus-master-config.json"
-IMAGE_NAME="nexus-node:v3.2"
+IMAGE_NAME="nexus:3.0"
 BUILD_DIR="$MAIN_DIR/build"
 ROTATE_SCRIPT_PATH="$MAIN_DIR/nexus-rotate.sh"
 LOGS_DIR="$MAIN_DIR/logs"
@@ -35,8 +36,7 @@ CRON_JOB_COMMAND="0 */2 * * * ${ROTATE_SCRIPT_PATH} >> ${ROTATE_SCRIPT_LOG_FILE}
 
 function check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "❌ 错误：此脚本需要以 root 用户权限运行。" 
-        echo "请尝试使用 'sudo -i' 或 'sudo ./nexus_3.2_final.sh' 来运行。"
+        echo "❌ 错误：此脚本需要以 root 用户权限运行。"
         exit 1
     fi
 }
@@ -44,55 +44,31 @@ function check_root() {
 function ensure_dependencies() {
     local to_install=""
     for cmd in jq nano curl; do
-        if ! command -v $cmd &> /dev/null; then 
+        if ! command -v $cmd &> /dev/null; then
             to_install+="$cmd "
         fi
     done
-
     if [ -n "$to_install" ]; then
         read -rp "⚠️ 检测到缺少依赖工具: $to_install。是否尝试自动安装？[Y/n]: " confirm
-        if [[ "$confirm" =~ ^[yY]$ ]] || [ -z "$confirm" ]; then 
-            if command -v apt-get &> /dev/null; then 
-                echo "▶️ 正在使用 apt 安装..."
-                apt-get update
-                apt-get install -y $to_install
-            elif command -v yum &> /dev/null; then 
-                echo "▶️ 正在使用 yum 安装..."
-                yum install -y $to_install
-            else
-                echo "❌ 无法确定包管理器 (apt/yum)。请手动安装: $to_install"
-                exit 1
-            fi
+        if [[ "$confirm" =~ ^[yY]$ ]] || [ -z "$confirm" ]; then
+            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $to_install;
+            elif command -v yum &> /dev/null; then yum install -y $to_install;
+            else echo "❌ 无法确定包管理器。请手动安装: $to_install"; exit 1; fi
         fi
     fi
-
-    if ! command -v docker &> /dev/null; then 
+    if ! command -v docker &> /dev/null; then
         read -rp "⚠️ 核心依赖 Docker 未安装。是否为您执行全自动安装？[Y/n]: " confirm
-        if [[ "$confirm" =~ ^[yY]$ ]] || [ -z "$confirm" ]; then 
+        if [[ "$confirm" =~ ^[yY]$ ]] || [ -z "$confirm" ]; then
             echo "▶️ 正在执行 Docker 全自动安装..."
-            if command -v apt-get &> /dev/null; then 
-                # Commands for Docker installation on Debian/Ubuntu
-                apt-get update
-                apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - 
-                add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" -y
-                apt-get update
-                apt-get install -y docker-ce
-            elif command -v yum &> /dev/null; then 
-                # Commands for Docker installation on CentOS/RHEL
-                yum install -y yum-utils
-                yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-                yum install -y docker-ce docker-ce-cli containerd.io
-            fi
-            systemctl enable docker
-            systemctl start docker
-            echo "✅ Docker 安装并启动成功！" 
-        else
-            echo "❌ 用户取消安装 Docker。脚本无法继续。"
-            exit 1
-        fi
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sh get-docker.sh
+            systemctl enable docker && systemctl start docker
+            rm get-docker.sh
+            echo "✅ Docker 安装并启动成功！"
+        else echo "❌ 用户取消安装 Docker。脚本无法继续。"; exit 1; fi
     fi
 }
+
 
 # ================================================================
 # ==                  核心文件准备与构建函数                    ==
@@ -100,26 +76,18 @@ function ensure_dependencies() {
 
 function prepare_and_build_image() {
     if docker image inspect "$IMAGE_NAME" &>/dev/null; then
-        read -rp "⚠️ 检测到已存在名为 [$IMAGE_NAME] 的镜像。可能含有旧配置。是否强制删除并重新构建？[y/N]: " confirm
-        if [[ "$confirm" =~ ^[yY]$ ]]; then
-             echo "▶️ 正在删除旧镜像..."
-             docker rmi -f "$IMAGE_NAME" &>/dev/null || true
-        else
-            echo "✅ 使用已存在的Docker镜像。"
-            return
-        fi
+        echo "✅ Docker 镜像 [$IMAGE_NAME] 已存在，将直接使用。"
+        return
     fi
 
-    echo "▶️ 正在准备构建新镜像..."
+    echo "▶️ Docker 镜像 [$IMAGE_NAME] 不存在，开始自动构建..."
     mkdir -p "$BUILD_DIR"
     
-    # 1. 动态创建 Dockerfile
-    echo "    - 正在动态创建 Dockerfile..."
     cat > "$BUILD_DIR/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    curl screen bash jq dnsutils proxychains4 util-linux \
+    curl screen bash jq dnsutils proxychains4 util-linux ncurses-bin \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -sSL https://cli.nexus.xyz/ | bash && \
     cp /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network && \
@@ -129,34 +97,26 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    # 2. 动态创建 entrypoint.sh (包含5分钟日志清空逻辑)
-    echo "    - 正在动态创建 entrypoint.sh..."
     cat > "$BUILD_DIR/entrypoint.sh" <<'EOF'
 #!/bin/bash
 set -e
 LOG_FILE=${NEXUS_LOG:-"/root/nexus.log"}
 SCREEN_NAME=${SCREEN_NAME:-"nexus"}
 
-if [ -z "$NODE_ID" ]; then
-    echo "错误: 必须提供 NODE_ID 环境变量。"
-    exit 1
-fi
+if [ -z "$NODE_ID" ]; then echo "错误: 必须提供 NODE_ID 环境变量。"; exit 1; fi
 
-CONFIG_DIR="/root/.nexus"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-mkdir -p "$CONFIG_DIR"
-echo "{ \"node_id\": \"$NODE_ID\" }" > "$CONFIG_FILE"
-echo "已成功创建配置文件，使用的 Node ID: $NODE_ID"
+# 统一日志清理逻辑：任何启动/重启，都先清空日志
+truncate -s 0 "$LOG_FILE"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Container starting. Log cleared." >> "$LOG_FILE"
+
+mkdir -p "/root/.nexus" && echo "{ \"node_id\": \"$NODE_ID\" }" > "/root/.nexus/config.json"
 
 PROXY_COMMAND=""
 if [ -n "$PROXY_ADDR" ] && [ "$PROXY_ADDR" != "no_proxy" ]; then
-    echo "检测到代理地址，正在配置 proxychains..."
     PROXY_HOST=$(echo "$PROXY_ADDR" | sed -E 's_.*@(.*):.*_\1_')
     if ! [[ $PROXY_HOST =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "▶️ 代理地址为域名 ($PROXY_HOST)，正在进行预解析..."
         PROXY_IP=$(getent hosts "$PROXY_HOST" | awk '{ print $1 }' | head -n 1)
         if [ -z "$PROXY_IP" ]; then echo "❌ 错误：无法解析域名 $PROXY_HOST"; exit 1; fi
-        echo "✅ 解析成功, IP为: $PROXY_IP"
         FINAL_PROXY_STRING=$(echo "$PROXY_ADDR" | sed "s/$PROXY_HOST/$PROXY_IP/")
     else
         FINAL_PROXY_STRING="$PROXY_ADDR"
@@ -164,47 +124,28 @@ if [ -n "$PROXY_ADDR" ] && [ "$PROXY_ADDR" != "no_proxy" ]; then
     cat > /etc/proxychains4.conf <<EOCF
 strict_chain
 proxy_dns
-remote_dns_subnet 224
-tcp_read_time_out 15000
-tcp_connect_time_out 8000
 [ProxyList]
 $FINAL_PROXY_STRING
 EOCF
     PROXY_COMMAND="proxychains4"
-else
-    echo "未配置代理，将使用本机IP直连。"
 fi
 
-# 在后台启动一个5分钟日志清空循环
-(
-    while true; do
-        sleep 300
-        # 使用 truncate 清空文件，不会破坏正在写入的进程的文件句柄
-        truncate -s 0 "$LOG_FILE"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log file automatically truncated." >> "$LOG_FILE"
-    done
-) &
+# 运行时高频刷新：后台启动一个5分钟日志清空循环
+( while true; do sleep 300; truncate -s 0 "$LOG_FILE"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log automatically refreshed." >> "$LOG_FILE"; done ) &
 
-# 启动主进程
 screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
 screen -dmS "$SCREEN_NAME" bash -c "$PROXY_COMMAND nexus-network start --node-id $NODE_ID &>> $LOG_FILE"
 
-# 检查并输出日志
 sleep 3
 if screen -list | grep -q "$SCREEN_NAME"; then
-    echo "实例 [$SCREEN_NAME] 已成功在后台启动。"
-    echo "日志文件位于: $LOG_FILE (每5分钟自动清空)"
+    echo "ID [$NODE_ID] 已在后台启动。日志文件: $LOG_FILE"
     echo "--- 开始实时输出日志 (按 Ctrl+C 停止查看) ---"
     tail -f "$LOG_FILE"
 else
-    echo "错误：实例 [$SCREEN_NAME] 启动失败！"
-    cat "$LOG_FILE"
-    exit 1
+    echo "错误：ID [$NODE_ID] 启动失败！"; cat "$LOG_FILE"; exit 1;
 fi
 EOF
 
-    # 3. 动态创建轮换脚本 nexus-rotate.sh (包含销毁日志逻辑)
-    echo "    - 正在动态创建 nexus-rotate.sh..."
     cat > "$ROTATE_SCRIPT_PATH" <<EOF
 #!/bin/bash
 set -e
@@ -214,36 +155,24 @@ IMAGE_NAME="${IMAGE_NAME}"
 LOGS_DIR="\$MAIN_DIR/logs"
 
 echo "[$(date)] 开始执行自动轮换..."
-
 if [ ! -f "\$CONFIG_FILE" ]; then exit 0; fi
-
 instance_keys=\$(jq -r 'keys[] | select(startswith("nexus-group-"))' "\$CONFIG_FILE")
 if [ -z "\$instance_keys" ]; then exit 0; fi
 
 for key in \$instance_keys; do
-    echo "[$(date)] --- 正在处理实例组: \$key ---"
     instance_data=\$(jq ".\\"\$key\\"" "\$CONFIG_FILE")
     proxy_address=\$(echo "\$instance_data" | jq -r '.proxy_address')
     id_pool_str=\$(echo "\$instance_data" | jq -r '.id_pool | @tsv')
     current_id_index=\$(echo "\$instance_data" | jq -r '.current_id_index')
-    
     read -r -a id_pool <<< "\$id_pool_str"
     pool_size=\${#id_pool[@]}
     if [ \$pool_size -eq 0 ]; then continue; fi
-    
     next_id_index=\$(( (current_id_index + 1) % pool_size ))
     new_node_id=\${id_pool[\$next_id_index]}
-
-    echo "[$(date)]     - 旧索引: \$current_id_index -> 新索引: \$next_id_index. 新 Node ID: \$new_node_id"
     group_num=\$(echo "\$key" | sed 's/nexus-group-//')
     log_file="\$LOGS_DIR/nexus-group-\${group_num}.log"
     
-    # 核心日志管理：销毁旧日志
-    echo "[$(date)]     - 正在销毁旧日志: \$log_file"
-    rm -f "\$log_file"
-    mkdir -p "\$LOGS_DIR" && touch "\$log_file"
-
-    echo "[$(date)]     - 正在销毁并重建容器: \$key"
+    rm -f "\$log_file" && touch "\$log_file"
     docker rm -f "\$key" &>/dev/null || true
     
     docker run -d \\
@@ -255,26 +184,21 @@ for key in \$instance_keys; do
         -v "\$log_file":"\$log_file" \\
         "\$IMAGE_NAME"
 
-    # 更新配置文件中的当前ID索引
     temp_config=\$(jq ".\\"\$key\\".current_id_index = \$next_id_index" "\$CONFIG_FILE")
     echo "\$temp_config" > "\$CONFIG_FILE"
-    echo "[$(date)]     - 实例组 \$key 已重启并更新状态。"
 done
-echo "[$(date)] 所有实例组轮换完成。"
+echo "[$(date)] 所有ID轮换完成。"
 EOF
     chmod +x "$ROTATE_SCRIPT_PATH"
     
-    # 4. 执行 Docker 构建
-    echo "▶️ 核心文件准备就绪，开始执行 docker build..."
+    echo "▶️ 正在执行 docker build..."
     docker build -t "$IMAGE_NAME" "$BUILD_DIR"
     echo "✅ Docker 镜像 [$IMAGE_NAME] 构建成功！"
 }
 
-# --- 单实例组轮换/重启辅助函数 ---
 function rotate_single_group() {
     local key_to_rotate=$1
     echo "▶️ 正在手动轮换实例组 ${key_to_rotate} 到下一个ID..."
-    # 直接调用轮换脚本，但只处理指定的key
     instance_data=$(jq ".\"$key_to_rotate\"" "$CONFIG_FILE")
     proxy_address=$(echo "$instance_data" | jq -r '.proxy_address')
     id_pool_str=$(echo "$instance_data" | jq -r '.id_pool | @tsv')
@@ -287,7 +211,6 @@ function rotate_single_group() {
     group_num=$(echo "$key_to_rotate" | sed 's/nexus-group-//')
     log_file="$LOGS_DIR/nexus-group-${group_num}.log"
     
-    echo "    - 新 Node ID: $new_node_id"
     rm -f "$log_file" && touch "$log_file"
     docker rm -f "$key_to_rotate" &>/dev/null || true
     docker run -d --name "$key_to_rotate" -e NODE_ID="$new_node_id" -e PROXY_ADDR="$proxy_address" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-group-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
@@ -297,68 +220,62 @@ function rotate_single_group() {
     echo "✅ 实例组 $key_to_rotate 已轮换。"
 }
 
+function restart_all_ids() {
+    echo "▶️ 正在重启所有ID..."
+    if [ ! -f "$CONFIG_FILE" ]; then return; fi
+    local group_keys=$(jq -r 'keys[] | select(startswith("nexus-group-"))' "$CONFIG_FILE")
+    if [ -n "$group_keys" ]; then
+        for key in $group_keys; do
+            if docker ps -q -f "name=^/${key}$" | grep -q .; then
+                echo "    - 正在重启 $key..."
+                docker restart "$key" > /dev/null
+            fi
+        done
+    fi
+    echo "✅ 所有正在运行的ID已发出重启命令。"
+}
+
 # ================================================================
 # ==                      菜单功能实现                          ==
 # ================================================================
 
 function create_instance_groups() {
     prepare_and_build_image
-    
     local group_count
     while true; do
         read -rp "请输入您想创建的实例组数量: " group_count
         if [[ "$group_count" =~ ^[1-9][0-9]*$ ]]; then break; else echo "❌ 无效输入。"; fi
     done
-
-    declare -A groups_proxy
-    declare -A groups_ids
-
+    declare -A groups_proxy; declare -A groups_ids
     for i in $(seq 1 "$group_count"); do
         echo "--- 正在配置第 $i 组 ---"
         read -rp "请输入该组SOCKS5代理地址 (留空则本机IP): " proxy_addr
         [ -z "$proxy_addr" ] && proxy_addr="no_proxy"
         groups_proxy[$i]="$proxy_addr"
-        
         local id_pool=()
         while true; do
             echo "💡 请输入该组的所有 Node ID (用空格分隔，数量不限):"
             read -ra id_pool
-            if [ ${#id_pool[@]} -eq 0 ]; then
-                echo "❌ 请至少输入一个 Node ID。"
-            else
-                break
-            fi
+            if [ ${#id_pool[@]} -eq 0 ]; then echo "❌ 请至少输入一个 Node ID。"; else break; fi
         done
         groups_ids[$i]="${id_pool[*]}"
     done
-
     echo "▶️ 正在更新配置文件..."
-    mkdir -p "$MAIN_DIR"
-    [ ! -f "$CONFIG_FILE" ] && echo "{}" > "$CONFIG_FILE"
-    
+    mkdir -p "$MAIN_DIR"; [ ! -f "$CONFIG_FILE" ] && echo "{}" > "$CONFIG_FILE"
     local current_config=$(cat "$CONFIG_FILE")
     local last_group_num=$(echo "$current_config" | jq -r 'keys[] | select(startswith("nexus-group-")) | split("-")[2] | tonumber' | sort -n | tail -1)
     [ -z "$last_group_num" ] && last_group_num=0
-    
     local new_group_keys=()
     for i in $(seq 1 "$group_count"); do
         local next_group_num=$((last_group_num + i))
         local group_key="nexus-group-${next_group_num}"
         new_group_keys+=("$group_key")
-        local proxy_addr=${groups_proxy[$i]}
-        read -r -a id_pool <<< "${groups_ids[$i]}"
-        current_config=$(echo "$current_config" | jq \
-            --arg key "$group_key" \
-            --arg proxy "$proxy_addr" \
-            --argjson ids_json "$(printf '"%s"\n' "${id_pool[@]}" | jq -s .)" \
-            '. + {($key): {"proxy_address": $proxy, "id_pool": $ids_json, "current_id_index": 0}}')
+        local proxy_addr=${groups_proxy[$i]}; read -r -a id_pool <<< "${groups_ids[$i]}"
+        current_config=$(echo "$current_config" | jq --arg key "$group_key" --arg proxy "$proxy_addr" --argjson ids_json "$(printf '"%s"\n' "${id_pool[@]}" | jq -s .)" '. + {($key): {"proxy_address": $proxy, "id_pool": $ids_json, "current_id_index": 0}}')
     done
-    
     echo "$current_config" | jq . > "$CONFIG_FILE"
     echo "✅ 配置文件已更新。"
-
     manage_auto_rotation "auto_enable"
-
     echo "▶️ 正在根据新配置启动容器..."
     mkdir -p "$LOGS_DIR"
     for key in "${new_group_keys[@]}"; do
@@ -366,20 +283,10 @@ function create_instance_groups() {
         local node_id=$(echo "$group_data" | jq -r '.id_pool[0]')
         local proxy_addr=$(echo "$group_data" | jq -r '.proxy_address')
         local group_num=$(echo "$key" | sed 's/nexus-group-//')
-        local log_file="$LOGS_DIR/nexus-group-${group_num}.log"
-        touch "$log_file"
-
+        local log_file="$LOGS_DIR/nexus-group-${group_num}.log"; touch "$log_file"
         echo "    - 正在启动 $key (初始ID: $node_id)..."
-        docker run -d \
-            --name "$key" \
-            -e NODE_ID="$node_id" \
-            -e PROXY_ADDR="$proxy_addr" \
-            -e NEXUS_LOG="$log_file" \
-            -e SCREEN_NAME="nexus-group-${group_num}" \
-            -v "$log_file":"$log_file" \
-            "$IMAGE_NAME"
+        docker run -d --name "$key" -e NODE_ID="$node_id" -e PROXY_ADDR="$proxy_addr" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-group-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
     done
-    
     echo "✅ 所有新实例组已成功启动！"
 }
 
@@ -387,50 +294,55 @@ function show_control_center() {
     if [ ! -f "$CONFIG_FILE" ] || ! jq -e '. | keys | length > 0' "$CONFIG_FILE" > /dev/null; then
         echo "❌ 配置文件不存在或为空。"; return;
     fi
-    
     clear; show_welcome_message
-    echo "=========== 实例组控制中心 ==========="
-    
-    local group_keys
-    group_keys=$(jq -r 'keys[] | select(startswith("nexus-group-")) | @sh' "$CONFIG_FILE" | sort -V | xargs)
+    echo "===================================== 实例组控制中心 ====================================="
+    printf "%-18s | %-10s | %-12s | %s\n" "实例组" "状态" "周期计时" "当前活动ID (进度)"
+    echo "--------------------------------------------------------------------------------------------"
+    local group_keys=$(jq -r 'keys[] | select(startswith("nexus-group-")) | @sh' "$CONFIG_FILE" | sort -V | xargs)
     if [ -z "$group_keys" ]; then echo "没有找到任何实例组配置。"; return; fi
-
     for key in $group_keys; do
-        local group_num=$(echo "$key" | sed 's/nexus-group-//')
         local group_data=$(jq ".\"$key\"" "$CONFIG_FILE")
         local current_id_index=$(echo "$group_data" | jq -r '.current_id_index')
         local id_pool_str=$(echo "$group_data" | jq -r '.id_pool | @tsv')
-        read -r -a id_pool <<< "$id_pool_str"
+        read -r -a id_pool <<< "$id_pool_str"; local pool_size=${#id_pool[@]}
         local current_id=${id_pool[$current_id_index]:-"N/A"}
-        local status="Stopped"
-        if docker ps -q -f "name=^/${key}$" | grep -q .; then status="Running"; fi
-
-        echo "-----------------------------------------------------"
-        printf "实例组: %-15s | 状态: %-10s\n" "$key" "$status"
-        printf "当前活动ID: %s\n" "$current_id"
+        local status="Stopped"; local uptime="N/A"
+        if docker ps -q -f "name=^/${key}$" | grep -q .; then
+            status="Running"
+            local started_at=$(docker inspect --format='{{.State.StartedAt}}' "$key" 2>/dev/null || echo "")
+            if [ -n "$started_at" ]; then
+                local start_seconds=$(date --date="$started_at" +%s)
+                local now_seconds=$(date +%s)
+                local uptime_seconds=$((now_seconds - start_seconds))
+                local hours=$(( uptime_seconds / 3600 ))
+                local minutes=$(( (uptime_seconds % 3600) / 60 ))
+                local seconds=$(( uptime_seconds % 60 ))
+                uptime=$(printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds")
+            fi
+        fi
+        printf "%-18s | %-10s | %-12s | %s (%d/%d)\n" "$key" "$status" "$uptime" "$current_id" $((current_id_index + 1)) $pool_size
     done
-    echo "-----------------------------------------------------"
-
+    echo "--------------------------------------------------------------------------------------------"
     read -rp "请输入您想管理的实例组编号 (例如 1)，或直接按回车返回: " selected_num
     if [[ "$selected_num" =~ ^[0-9]+$ ]]; then
         local selected_key="nexus-group-${selected_num}"
         if ! jq -e ".\"$selected_key\"" "$CONFIG_FILE" > /dev/null; then echo "❌ 无效编号。"; return; fi
-        
         clear; show_welcome_message
         echo "--- 正在管理实例组: $selected_key ---"
-        echo "  1. 查看实时日志 (5分钟一清)"
-        echo "  2. 重启此实例组 (原地复活，ID和日志不清)"
-        echo "  3. 停止此实例组 (销毁)"
-        echo "  4. 手动轮换到下一个ID (换人接班，清日志)"
+        echo "  1. 查看实时日志"
+        echo "  2. 重启当前ID (原地复活)"
+        echo "  3. 停止此ID (销毁)"
+        echo "  4. 手动轮换到下一个ID (换人接班)"
         read -rp "请选择操作 (或按回车返回): " action
         case "$action" in
             1) 
                 local log_file="$LOGS_DIR/nexus-group-${selected_num}.log"
                 echo "💡 正在打开日志: $log_file (按 Ctrl+C 退出)"
-                local saved_stty; saved_stty=$(stty -g) 
-                trap 'stty "$saved_stty"; tput cnorm; reset; echo -e "\n\n✅ 终端状态已恢复。"' INT 
+                local saved_stty; saved_stty=$(stty -g)
+                # 终极终端修复：发送原始指令码关闭鼠标，恢复光标，最后重置终端
+                trap 'printf "\e[?1000l\e[?1002l\e[?1003l"; tput cnorm 2>/dev/null || true; stty "$saved_stty"; reset; echo -e "\n\n✅ 终端状态已通过终极方案恢复。"' INT
                 tail -f "$log_file"
-                stty "$saved_stty"; tput cnorm; reset 
+                printf "\e[?1000l\e[?1002l\e[?1003l"; tput cnorm 2>/dev/null || true; stty "$saved_stty"; reset
                 trap - INT
                 ;;
             2) echo "正在原地重启 $selected_key..."; docker restart "$selected_key" > /dev/null; echo "✅ 重启完成。" ;;
@@ -441,11 +353,22 @@ function show_control_center() {
     fi
 }
 
-function stop_all_instances() {
-    if [ ! -f "$CONFIG_FILE" ]; then echo "没有找到任何实例配置。"; return; fi
-    read -rp "您确定要停止所有实例组吗？[y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[yY]$ ]]; then echo "操作已取消。"; return; fi
-    echo "🛑 正在停止所有由本脚本管理的实例组..."
+function manage_batch_ops() {
+    clear; show_welcome_message
+    echo "--- 停止/重启所有ID ---"
+    echo "  1. 停止所有ID (立即执行)"
+    echo "  2. 重启所有ID (立即执行)"
+    read -rp "请选择操作 (或按回车返回): " action
+    case "$action" in
+        1) stop_all_ids ;;
+        2) restart_all_ids ;;
+        *) return ;;
+    esac
+}
+
+function stop_all_ids() {
+    echo "🛑 正在停止所有ID..."
+    if [ ! -f "$CONFIG_FILE" ]; then return; fi
     local group_keys=$(jq -r 'keys[] | select(startswith("nexus-group-"))' "$CONFIG_FILE")
     if [ -n "$group_keys" ]; then
         for key in $group_keys; do
@@ -455,14 +378,14 @@ function stop_all_instances() {
             fi
         done
     fi
-    echo "✅ 所有实例组均已停止。"
+    echo "✅ 所有ID均已停止。"
 }
 
 function manual_rotate_all() {
     if [ ! -f "$CONFIG_FILE" ]; then echo "没有找到任何实例配置。"; return; fi
-    echo "▶️ 正在立即手动轮换所有实例组..."
+    echo "▶️ 正在立即手动轮换所有ID..."
     bash "$ROTATE_SCRIPT_PATH"
-    echo "✅ 所有实例组已发出轮换命令。"
+    echo "✅ 所有ID已发出轮换命令。"
 }
 
 function manage_auto_rotation() {
@@ -474,16 +397,13 @@ function manage_auto_rotation() {
         fi
         return
     fi
-    
     echo "--- 自动轮换管理 (Cron) ---"
     if [ "$cron_job_exists" -eq 0 ]; then
-        echo "✅ 状态：自动轮换当前已开启。"
-        read -rp "您确定要关闭吗？[y/N]: " confirm
-        if [[ "$confirm" =~ ^[yY]$ ]]; then (crontab -l | grep -vF "$ROTATE_SCRIPT_PATH") | crontab -; echo "✅ 自动轮换已关闭。"; fi
+        echo "✅ 状态：自动轮换当前已开启，将立即为您【关闭】。"
+        (crontab -l | grep -vF "$ROTATE_SCRIPT_PATH") | crontab -
     else
-        echo "❌ 状态：自动轮换当前已关闭。"
-        read -rp "您确定要开启吗？[y/N]: " confirm
-        if [[ "$confirm" =~ ^[yY]$ ]]; then (crontab -l 2>/dev/null; echo "$CRON_JOB_COMMAND") | crontab -; echo "✅ 自动轮换已开启。"; fi
+        echo "❌ 状态：自动轮换当前已关闭，将立即为您【开启】。"
+        (crontab -l 2>/dev/null; echo "$CRON_JOB_COMMAND") | crontab -
     fi
 }
 
@@ -514,8 +434,9 @@ function manage_configuration() {
             echo "找到以下备份文件:"
             select backup_file in "${backups[@]}"; do
                 if [ -n "$backup_file" ]; then
+                    echo "即将用 $(basename "$backup_file") 覆盖当前配置..."
                     cp "$backup_file" "$CONFIG_FILE"
-                    echo "✅ 配置已从 $(basename "$backup_file") 恢复。"
+                    echo "✅ 配置已恢复。"
                     break
                 else echo "无效选择。"; fi
             done
@@ -526,24 +447,26 @@ function manage_configuration() {
 
 function uninstall_script() {
     echo "‼️ 警告：此操作将彻底删除所有相关数据，且无法恢复！"
-    read -rp "您确定要继续吗? (请输入 y/Y 确认): " confirm
-    if [[ ! "$confirm" =~ ^[yY]$ ]]; then echo "操作已取消。"; return; fi
+    echo "将要删除的内容包括：所有容器、本项目镜像、构建缓存及整个工作目录。"
+    echo "▶️ 开始执行精准卸载..."
     
-    echo "▶️ 正在停止并删除所有实例组容器..."
+    echo "    - 正在停止并删除所有本脚本创建的容器..."
     if [ -f "$CONFIG_FILE" ]; then
         local group_keys=$(jq -r 'keys[] | select(startswith("nexus-group-"))' "$CONFIG_FILE")
         if [ -n "$group_keys" ]; then
             for key in $group_keys; do docker rm -f "$key" &>/dev/null || true; done
         fi
     fi
-    echo "    - 正在删除 Docker 镜像..."
+    echo "    - 正在删除本项目专属的 Docker 镜像 [$IMAGE_NAME]..."
     if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi
     echo "    - 正在移除 cron 定时任务..."
     crontab -l 2>/dev/null | grep -vF "$ROTATE_SCRIPT_PATH" | crontab -
+    echo "    - 正在清理Docker构建缓存..."
+    docker builder prune -f
     echo "    - 正在删除主目录: $MAIN_DIR..."
     rm -rf "$MAIN_DIR"
     
-    echo "✅ 卸载完成。"
+    echo "✅ 精准卸载完成。"
     echo "本脚本文件 '$0' 未被删除，您可以手动删除它。"
     exit 0
 }
@@ -557,7 +480,7 @@ function show_welcome_message() {
     cat << "EOF"
 ================================================================
 ##
-## Nexus Pro 节点管理脚本 v3.2 (融合版)
+## Nexus Pro 节点管理脚本 v3.0 (专业版)
 ##
 ================================================================
 EOF
@@ -569,14 +492,14 @@ function show_menu() {
     
     while true; do
         echo ""
-        echo "=========== Nexus Pro 节点管理面板 (v3.2) ==========="
+        echo "=========== Nexus Pro 节点管理面板 (v3.0) ==========="
         echo "[ 主要操作 ]"
-        echo "  1. 创建新的实例组 (无ID限制)"
-        echo "  2. 实例组控制中心 (查看/管理/操作)"
-        echo "  3. 停止所有实例组"
+        echo "  1. 创建新的实例组"
+        echo "  2. 实例组控制中心"
+        echo "  3. 停止/重启所有ID"
         echo ""
         echo "[ 手动控制 ]"
-        echo "  4. 手动轮换所有实例组 (立即执行)"
+        echo "  4. 手动轮换所有ID (立即执行)"
         echo ""
         echo "[ 系统管理 ]"
         echo "  5. 自动轮换管理 (开启/关闭2小时轮换)"
@@ -595,7 +518,7 @@ function show_menu() {
         case "$choice" in
             1) create_instance_groups ;;
             2) show_control_center ;;
-            3) stop_all_instances ;;
+            3) manage_batch_ops ;;
             4) manual_rotate_all ;;
             5) manage_auto_rotation ;;
             6) manage_configuration ;;
