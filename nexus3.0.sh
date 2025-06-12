@@ -1,17 +1,18 @@
 #!/bin/bash
 #
 # 脚本名称: nexus3.0.sh
-# 描述: Nexus Pro 节点管理脚本 v3.0 (专业版)
+# 描述: Nexus Pro 节点管理脚本 v3.0 (最终稳定版)
 #
 # --- 特性 ---
 # 1. 镜像名称统一为 nexus:3.0。
 # 2. 移除所有操作性[Y/N]确认，实现“即点即生效”。
 # 3. 实例组轮换模型: 无限ID池, 每组一个活动ID。
-# 4. 定时轮换: 通过 Cron 实现每2小时自动轮换。
-# 5. 统一日志清理: 任何启动/重启皆清空日志，且运行时每5分钟刷新。
-# 6. 终极终端修复: 通过发送原始指令码解决顽固的终端劫持问题。
-# 7. 周期计时器: 在控制中心显示 HH:MM:SS 格式的当前周期运行时长。
+# 4. 2小时轮换: 通过 Cron 实现每2小时销毁重建容器并轮换ID。
+# 5. 统一日志清理: 任何导致容器启动/重启的操作，都会清空日志。
+# 6. 稳定日志查看: 回归 tail -f，并采用经过验证的trap指令完美恢复终端。
+# 7. 周期计时器: 在控制中心显示 HH:MM:SS 格式的当前容器运行时长。
 # 8. 精准卸载: 卸载时只清理与本项目相关的数据。
+# 9. 最终架构: 回归经过验证的“启动-验证”模式，保证重启稳定性。
 #
 
 # --- 安全设置：任何命令失败则立即退出 ---
@@ -48,6 +49,11 @@ function ensure_dependencies() {
             to_install+="$cmd "
         fi
     done
+    if ! command -v tput &> /dev/null || ! command -v reset &> /dev/null; then
+        if command -v apt-get &> /dev/null; then to_install+="ncurses-bin ";
+        elif command -v yum &> /dev/null; then to_install+="ncurses "; fi
+    fi
+
     if [ -n "$to_install" ]; then
         read -rp "⚠️ 检测到缺少依赖工具: $to_install。是否尝试自动安装？[Y/n]: " confirm
         if [[ "$confirm" =~ ^[yY]$ ]] || [ -z "$confirm" ]; then
@@ -75,12 +81,13 @@ function ensure_dependencies() {
 # ================================================================
 
 function prepare_and_build_image() {
+    # 强制重建镜像以确保应用最终的、最稳定的脚本逻辑
     if docker image inspect "$IMAGE_NAME" &>/dev/null; then
-        echo "✅ Docker 镜像 [$IMAGE_NAME] 已存在，将直接使用。"
-        return
+        echo "⚠️ 检测到已存在的旧镜像，将强制删除并重新构建以应用最新稳定版逻辑..."
+        docker rmi -f "$IMAGE_NAME" &>/dev/null || true
     fi
 
-    echo "▶️ Docker 镜像 [$IMAGE_NAME] 不存在，开始自动构建..."
+    echo "▶️ 正在准备并构建新镜像..."
     mkdir -p "$BUILD_DIR"
     
     cat > "$BUILD_DIR/Dockerfile" <<'EOF'
@@ -97,6 +104,7 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
+    # === 【回归初心版】 entrypoint.sh ===
     cat > "$BUILD_DIR/entrypoint.sh" <<'EOF'
 #!/bin/bash
 set -e
@@ -130,19 +138,24 @@ EOCF
     PROXY_COMMAND="proxychains4"
 fi
 
-# 运行时高频刷新：后台启动一个5分钟日志清空循环
-( while true; do sleep 300; truncate -s 0 "$LOG_FILE"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log automatically refreshed." >> "$LOG_FILE"; done ) &
-
-screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+# 1. 尝试在后台启动主进程
 screen -dmS "$SCREEN_NAME" bash -c "$PROXY_COMMAND nexus-network start --node-id $NODE_ID &>> $LOG_FILE"
 
+# 2. 等待3秒让进程初始化
 sleep 3
+
+# 3. 检查 screen 会话是否真的在运行
 if screen -list | grep -q "$SCREEN_NAME"; then
-    echo "ID [$NODE_ID] 已在后台启动。日志文件: $LOG_FILE"
-    echo "--- 开始实时输出日志 (按 Ctrl+C 停止查看) ---"
+    # 3a. 如果成功，则用 tail -f 日志文件的方式让容器保持存活
+    echo "[$(date)] ✅ Nexus 进程已成功在后台启动。容器将保持运行。" >> "$LOG_FILE"
+    # 此处 tail -f 的作用是保持容器前台进程不退出，从而维持容器存活
     tail -f "$LOG_FILE"
 else
-    echo "错误：ID [$NODE_ID] 启动失败！"; cat "$LOG_FILE"; exit 1;
+    # 3b. 如果失败，则打印错误日志，并让容器异常退出
+    echo "[$(date)] ❌ 错误：Nexus 进程启动失败！请检查下面的日志。" >> "$LOG_FILE"
+    # 打印最后10行错误信息
+    tail -n 10 "$LOG_FILE"
+    exit 1
 fi
 EOF
 
@@ -154,7 +167,7 @@ CONFIG_FILE="\$MAIN_DIR/nexus-master-config.json"
 IMAGE_NAME="${IMAGE_NAME}"
 LOGS_DIR="\$MAIN_DIR/logs"
 
-echo "[$(date)] 开始执行自动轮换..."
+echo "[$(date)] 开始执行2小时自动轮换..."
 if [ ! -f "\$CONFIG_FILE" ]; then exit 0; fi
 instance_keys=\$(jq -r 'keys[] | select(startswith("nexus-group-"))' "\$CONFIG_FILE")
 if [ -z "\$instance_keys" ]; then exit 0; fi
@@ -172,7 +185,7 @@ for key in \$instance_keys; do
     group_num=\$(echo "\$key" | sed 's/nexus-group-//')
     log_file="\$LOGS_DIR/nexus-group-\${group_num}.log"
     
-    rm -f "\$log_file" && touch "\$log_file"
+    rm -f "\$log_file" &>/dev/null || true; touch "\$log_file"
     docker rm -f "\$key" &>/dev/null || true
     
     docker run -d \\
@@ -180,12 +193,11 @@ for key in \$instance_keys; do
         -e NODE_ID="\$new_node_id" \\
         -e PROXY_ADDR="\$proxy_address" \\
         -e NEXUS_LOG="\$log_file" \\
-        -e SCREEN_NAME="nexus-group-\${group_num}" \\
+        -e SCREEN_NAME="nexus-${group_num}" \\
         -v "\$log_file":"\$log_file" \\
         "\$IMAGE_NAME"
 
-    temp_config=\$(jq ".\\"\$key\\".current_id_index = \$next_id_index" "\$CONFIG_FILE")
-    echo "\$temp_config" > "\$CONFIG_FILE"
+    jq ".\\"\$key\\".current_id_index = \$next_id_index" "\$CONFIG_FILE" > "\$CONFIG_FILE.tmp" && mv "\$CONFIG_FILE.tmp" "\$CONFIG_FILE"
 done
 echo "[$(date)] 所有ID轮换完成。"
 EOF
@@ -211,12 +223,11 @@ function rotate_single_group() {
     group_num=$(echo "$key_to_rotate" | sed 's/nexus-group-//')
     log_file="$LOGS_DIR/nexus-group-${group_num}.log"
     
-    rm -f "$log_file" && touch "$log_file"
+    rm -f "$log_file" &>/dev/null || true; touch "$log_file"
     docker rm -f "$key_to_rotate" &>/dev/null || true
-    docker run -d --name "$key_to_rotate" -e NODE_ID="$new_node_id" -e PROXY_ADDR="$proxy_address" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-group-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
+    docker run -d --name "$key_to_rotate" -e NODE_ID="$new_node_id" -e PROXY_ADDR="$proxy_address" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
     
-    temp_config=$(jq ".\"$key_to_rotate\".current_id_index = $next_id_index" "$CONFIG_FILE")
-    echo "$temp_config" > "$CONFIG_FILE"
+    jq ".\"$key_to_rotate\".current_id_index = $next_id_index" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     echo "✅ 实例组 $key_to_rotate 已轮换。"
 }
 
@@ -285,7 +296,7 @@ function create_instance_groups() {
         local group_num=$(echo "$key" | sed 's/nexus-group-//')
         local log_file="$LOGS_DIR/nexus-group-${group_num}.log"; touch "$log_file"
         echo "    - 正在启动 $key (初始ID: $node_id)..."
-        docker run -d --name "$key" -e NODE_ID="$node_id" -e PROXY_ADDR="$proxy_addr" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-group-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
+        docker run -d --name "$key" -e NODE_ID="$node_id" -e PROXY_ADDR="$proxy_addr" -e NEXUS_LOG="$log_file" -e SCREEN_NAME="nexus-${group_num}" -v "$log_file":"$log_file" "$IMAGE_NAME"
     done
     echo "✅ 所有新实例组已成功启动！"
 }
@@ -327,6 +338,7 @@ function show_control_center() {
     if [[ "$selected_num" =~ ^[0-9]+$ ]]; then
         local selected_key="nexus-group-${selected_num}"
         if ! jq -e ".\"$selected_key\"" "$CONFIG_FILE" > /dev/null; then echo "❌ 无效编号。"; return; fi
+        
         clear; show_welcome_message
         echo "--- 正在管理实例组: $selected_key ---"
         echo "  1. 查看实时日志"
@@ -339,10 +351,11 @@ function show_control_center() {
                 local log_file="$LOGS_DIR/nexus-group-${selected_num}.log"
                 echo "💡 正在打开日志: $log_file (按 Ctrl+C 退出)"
                 local saved_stty; saved_stty=$(stty -g)
-                # 终极终端修复：发送原始指令码关闭鼠标，恢复光标，最后重置终端
-                trap 'printf "\e[?1000l\e[?1002l\e[?1003l"; tput cnorm 2>/dev/null || true; stty "$saved_stty"; reset; echo -e "\n\n✅ 终端状态已通过终极方案恢复。"' INT
+                # 经过验证的、最稳定可靠的终端恢复方案
+                trap 'printf "\e[?1000l"; tput cnorm 2>/dev/null || true; reset; stty "$saved_stty"' INT
                 tail -f "$log_file"
-                printf "\e[?1000l\e[?1002l\e[?1003l"; tput cnorm 2>/dev/null || true; stty "$saved_stty"; reset
+                # 在正常退出或被中断时都执行恢复逻辑
+                printf "\e[?1000l"; tput cnorm 2>/dev/null || true; reset; stty "$saved_stty"
                 trap - INT
                 ;;
             2) echo "正在原地重启 $selected_key..."; docker restart "$selected_key" > /dev/null; echo "✅ 重启完成。" ;;
