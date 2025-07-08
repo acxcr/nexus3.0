@@ -239,20 +239,66 @@ function show_menu() {
         echo "1. 创建新的实例组"
         echo "2. 实例组控制中心"
         echo "3. 停止 / 重启 所有容器"
-        echo "4. 退出"
+        echo "4. 扫描配置文件部署新组"
+        echo "5. 退出"
         read -rp "请选择操作: " choice
         case "$choice" in
             1) create_instance_groups ;;
             2) show_control_center ;;
             3) manage_all_containers ;;
-            4) echo "再见！" ; exit 0 ;;
+            4) deploy_from_config_file ;;
+            5) echo "再见！" ; exit 0 ;;
             *) echo "无效输入，请重新选择" ;;
         esac
     done
 }
-
 # === 入口点 ===
 init_environment
 show_menu
+# === 从配置文件部署未部署的组 ===
+function deploy_from_config_file() {
+    echo ""
+    echo "▶️ 扫描配置文件中未部署的组并启动..."
+
+    config=$(cat "$CONFIG_FILE")
+    groups=$(echo "$config" | jq -r 'keys[] | select(test("^nexus-group-"))' | sort)
+    missing_containers=0
+
+    ensure_dependencies
+    build_image
+
+    for key in $groups; do
+        group_num=$(echo "$key" | cut -d- -f3)
+        group_name="g$group_num"
+        proxy=$(echo "$config" | jq -r --arg k "$key" '.[$k].proxy_address')
+        ids=($(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]'))
+
+        for i in "${!ids[@]}"; do
+            index=$((i + 1))
+            node_id="${ids[$i]}"
+            container_name="nexus-${group_name}-${index}"
+            log_file="$LOGS_DIR/${group_name}-${index}.log"
+
+            # 若容器尚不存在则部署
+            if ! docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+                echo "🆕 启动容器 $container_name"
+                docker run -d \
+                    --name "$container_name" \
+                    -e NODE_ID="$node_id" \
+                    -e PROXY_ADDR="$proxy" \
+                    -e NEXUS_LOG="$log_file" \
+                    -v "$log_file":"$log_file" \
+                    "$IMAGE_NAME"
+                ((missing_containers++))
+            fi
+        done
+    done
+
+    if [ "$missing_containers" -eq 0 ]; then
+        echo "✅ 没有发现未部署的容器，一切就绪。"
+    else
+        echo "✅ 成功部署 $missing_containers 个新容器。"
+    fi
+}
 
 
