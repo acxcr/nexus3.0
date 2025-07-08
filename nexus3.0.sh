@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# === 路径与全局变量 ===
+# === 核心路径与变量定义 ===
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 MAIN_DIR="$SCRIPT_DIR/nexus3.0"
 BUILD_DIR="$MAIN_DIR/build"
@@ -10,28 +10,21 @@ BACKUPS_DIR="$MAIN_DIR/backups"
 CONFIG_FILE="$MAIN_DIR/nexus-master-config.json"
 IMAGE_NAME="nexus:latest"
 
-# === 初始化目录结构 ===
+# === 初始化依赖与目录结构 ===
+function ensure_dependencies() {
+    echo "▶️ 检查并安装依赖..."
+    local pkgs=(curl bash jq proxychains4 screen ncurses-bin)
+    local missing=()
+    for p in "${pkgs[@]}"; do dpkg -s "$p" &>/dev/null || missing+=("$p"); done
+    if [ "${#missing[@]}" -ne 0 ]; then
+        echo "缺少以下依赖：${missing[*]}"
+        apt-get update && apt-get install -y "${missing[@]}"
+    fi
+}
+
 function init_environment() {
     mkdir -p "$BUILD_DIR" "$LOGS_DIR" "$BACKUPS_DIR"
     [ -f "$CONFIG_FILE" ] || echo "{}" > "$CONFIG_FILE"
-}
-
-# === 自动安装依赖（仅执行一次）===
-function ensure_dependencies() {
-    echo "▶️ 检查并安装依赖..."
-    local missing=""
-    for cmd in docker curl jq screen proxychains4; do
-        command -v $cmd >/dev/null 2>&1 || missing+="$cmd "
-    done
-    if [ -n "$missing" ]; then
-        echo "缺少以下依赖：$missing"
-        apt update && apt install -y $missing
-    fi
-    systemctl is-active docker >/dev/null 2>&1 || {
-        echo "Docker 未运行，正在启动..."
-        systemctl start docker
-    }
-    echo "✅ 所有依赖就绪。"
 }
 
 # === 构建镜像 ===
@@ -74,7 +67,7 @@ EOF
     docker build -t "$IMAGE_NAME" "$BUILD_DIR"
     echo "✅ 镜像构建完成。"
 }
-# === 创建实例组 ===
+# === 创建新的实例组 ===
 function create_instance_groups() {
     read -rp "请输入要创建的组数量: " group_count
     [[ "$group_count" =~ ^[1-9][0-9]*$ ]] || { echo "无效输入"; return; }
@@ -83,53 +76,85 @@ function create_instance_groups() {
     last_index=$(echo "$config" | jq -r 'keys[] | select(test("^nexus-group-")) | split("-")[2] | tonumber' | sort -n | tail -1)
     [ -z "$last_index" ] && last_index=0
 
-    declare -A new_groups
-    all_ids=()
+    declare -A group_proxies
+    declare -A group_ids
 
     for i in $(seq 1 "$group_count"); do
         group_num=$((last_index + i))
         group_key="nexus-group-$group_num"
         group_name="g$group_num"
-
-        echo ""
-        echo "------ 配置组 $group_name ------"
-
+        echo -e "\n------ 配置组 $group_name ------"
         read -rp "组 $group_name 的代理地址（留空默认 no_proxy）: " proxy
         [ -z "$proxy" ] && proxy="no_proxy"
-
         read -rp "请输入该组的 Node ID（空格分隔）: " -a id_pool
-        [ "${#id_pool[@]}" -eq 0 ] && { echo "⚠️ 组 $group_name 至少需要一个 ID，跳过该组。"; continue; }
+        [ "${#id_pool[@]}" -eq 0 ] && { echo "⚠️ 该组未提供任何 ID，跳过"; continue; }
 
-        # 临时记录组内容
-        new_groups["$group_key,proxy"]="$proxy"
-        new_groups["$group_key,ids"]="${id_pool[*]}"
-        all_ids+=("${id_pool[@]}")
+        group_proxies["$group_key"]="$proxy"
+        group_ids["$group_key"]="${id_pool[*]}"
     done
 
-    # 所有输入完成后再统一执行启动逻辑
-    echo ""
-    echo "▶️ 所有组配置已完成，正在准备部署..."
+    echo -e "\n▶️ 所有组配置已完成，正在准备部署..."
     ensure_dependencies
     build_image
 
-    for key in "${!new_groups[@]}"; do
-        if [[ "$key" == *,proxy ]]; then
-            group_key="${key%,proxy}"
-            proxy="${new_groups[$key]}"
-            id_list="${new_groups[$group_key,ids]}"
-            IFS=' ' read -r -a ids <<< "$id_list"
-            group_num=$(echo "$group_key" | cut -d- -f3)
-            group_name="g$group_num"
+    for key in "${!group_proxies[@]}"; do
+        group_num=$(echo "$key" | cut -d- -f3)
+        group_name="g$group_num"
+        proxy="${group_proxies[$key]}"
+        IFS=' ' read -r -a ids <<< "${group_ids[$key]}"
 
-            echo "▶️ 启动 $group_name（共 ${#ids[@]} 个节点）..."
+        echo "▶️ 启动 $group_name（共 ${#ids[@]} 个节点）..."
+        for i in "${!ids[@]}"; do
+            index=$((i + 1))
+            node_id="${ids[$i]}"
+            container_name="nexus-${group_name}-${index}"
+            log_file="$LOGS_DIR/${group_name}-${index}.log"
 
-            for j in "${!ids[@]}"; do
-                index=$((j + 1))
-                node_id="${ids[$j]}"
-                container_name="nexus-${group_name}-${index}"
-                log_file="$LOGS_DIR/${group_name}-${index}.log"
+            docker rm -f "$container_name" &>/dev/null || true
+            docker run -d \
+                --name "$container_name" \
+                -e NODE_ID="$node_id" \
+                -e PROXY_ADDR="$proxy" \
+                -e NEXUS_LOG="$log_file" \
+                -v "$log_file":"$log_file" \
+                "$IMAGE_NAME"
+            echo "    ✅ 启动 $container_name"
+        done
 
-                docker rm -f "$container_name" &>/dev/null || true
+        # 更新配置文件
+        ids_json=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s .)
+        config=$(echo "$config" | jq --arg k "$key" --arg p "$proxy" --argjson ids "$ids_json" '.[$k] = {proxy_address: $p, id_pool: $ids}')
+    done
+
+    echo "$config" > "$CONFIG_FILE"
+    echo -e "\n✅ 所有实例组已成功部署并写入配置文件。"
+}
+# === 从配置文件部署未部署的组 ===
+function deploy_from_config_file() {
+    echo "▶️ 扫描配置文件并部署未运行的容器..."
+
+    [ -f "$CONFIG_FILE" ] || { echo "❌ 未找到配置文件：$CONFIG_FILE"; return; }
+    ensure_dependencies
+    build_image
+
+    config=$(cat "$CONFIG_FILE")
+    groups=$(echo "$config" | jq -r 'keys[]')
+
+    for key in $groups; do
+        group_num=$(echo "$key" | cut -d- -f3)
+        group_name="g$group_num"
+        proxy=$(echo "$config" | jq -r --arg k "$key" '.[$k].proxy_address')
+        ids=$(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]')
+
+        i=1
+        for node_id in $ids; do
+            container_name="nexus-${group_name}-${i}"
+            log_file="$LOGS_DIR/${group_name}-${i}.log"
+
+            if docker ps -a --format '{{.Names}}' | grep -q "^$container_name$"; then
+                echo "⏩ 已存在容器 $container_name，跳过"
+            else
+                echo "🚀 启动新容器 $container_name"
                 docker run -d \
                     --name "$container_name" \
                     -e NODE_ID="$node_id" \
@@ -137,101 +162,74 @@ function create_instance_groups() {
                     -e NEXUS_LOG="$log_file" \
                     -v "$log_file":"$log_file" \
                     "$IMAGE_NAME"
-
                 echo "    ✅ 启动 $container_name"
-            done
-
-            # 更新主配置 JSON
-            id_json=$(printf '"%s"\n' "${ids[@]}" | jq -s .)
-            config=$(echo "$config" | jq --arg key "$group_key" --arg proxy "$proxy" --argjson ids "$id_json" '. + {($key): {proxy_address: $proxy, id_pool: $ids}}')
-        fi
+            fi
+            i=$((i + 1))
+        done
     done
 
-    echo "$config" | jq . > "$CONFIG_FILE"
-    echo ""
-    echo "✅ 所有实例组已成功部署并写入配置文件。"
+    echo "✅ 所有尚未部署的容器已完成部署。"
 }
-# === 控制中心：查看状态、重启、日志 ===
+# === 实例组控制中心 ===
 function show_control_center() {
-    local config=$(cat "$CONFIG_FILE")
-    local keys=$(echo "$config" | jq -r 'keys[] | select(test("^nexus-group-"))' | sort)
+    config=$(cat "$CONFIG_FILE")
+    groups=$(echo "$config" | jq -r 'keys[]')
 
-    for key in $keys; do
-        local group_num=$(echo "$key" | cut -d- -f3)
-        local group_name="g$group_num"
-        local proxy=$(echo "$config" | jq -r --arg k "$key" '.[$k].proxy_address')
-        local ids=($(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]'))
+    for key in $groups; do
+        group_num=$(echo "$key" | cut -d- -f3)
+        group_name="g$group_num"
+        proxy=$(echo "$config" | jq -r --arg k "$key" '.[$k].proxy_address')
+        ids=$(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]')
 
-        echo ""
-        echo "============================== 组 $group_name =============================="
+        echo -e "\n============================== 组 $group_name =============================="
         echo "代理地址：$proxy"
-        echo ""
-        printf "%-20s | %-8s | %-10s | %s\n" "容器名" "状态" "运行时间" "Node ID"
+        echo -e "\n容器名            | 状态   | 运行时间 | Node ID"
         echo "----------------------------------------------------------------------------"
 
-        for i in "${!ids[@]}"; do
-            local idx=$((i + 1))
-            local cname="nexus-${group_name}-${idx}"
-            local nid="${ids[$i]}"
-            local status="Stopped"
-            local uptime="N/A"
-
-            if docker ps -q -f "name=^/${cname}$" | grep -q .; then
-                status="Running"
-                local started=$(docker inspect -f '{{.State.StartedAt}}' "$cname" 2>/dev/null)
-                if [ -n "$started" ]; then
-                    local start_ts=$(date -d "$started" +%s)
-                    local now_ts=$(date +%s)
-                    local diff=$((now_ts - start_ts))
-                    uptime=$(printf "%02d:%02d:%02d" $((diff/3600)) $((diff%3600/60)) $((diff%60)))
-                fi
-            fi
-            printf "%-20s | %-8s | %-10s | %s\n" "$cname" "$status" "$uptime" "$nid"
+        i=1
+        for node_id in $ids; do
+            cname="nexus-${group_name}-${i}"
+            status=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "Not Found")
+            uptime=$(docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' "$cname" 2>/dev/null | awk '{print $2}' | xargs -I{} date -d {} '+%H:%M:%S' 2>/dev/null || echo "N/A")
+            [ "$status" != "running" ] && uptime="N/A"
+            printf "%-20s | %-7s | %-9s | %s\n" "$cname" "$status" "$uptime" "$node_id"
+            i=$((i + 1))
         done
 
         echo "----------------------------------------------------------------------------"
         echo "操作选项："
         echo "  1. 查看日志   2. 重启容器   3. 停止容器   4. 跳过本组"
-        read -rp "请选择 (1/2/3/4): " action
-
-        if [[ "$action" =~ ^[1-3]$ ]]; then
-            read -rp "请输入要操作的容器编号 (例如 1): " index
-            [[ "$index" =~ ^[0-9]+$ ]] || { echo "无效编号"; continue; }
-            local cname="nexus-${group_name}-${index}"
-            local log_file="$LOGS_DIR/${group_name}-${index}.log"
-            case "$action" in
-                1) echo "按 Ctrl+C 退出日志查看"; tail -f "$log_file" ;;
-                2) docker restart "$cname" && echo "已重启 $cname" ;;
-                3) docker rm -f "$cname" && echo "已停止并删除 $cname" ;;
+        read -rp "请选择 (1/2/3/4): " op
+        i=1
+        for node_id in $ids; do
+            cname="nexus-${group_name}-${i}"
+            log_file="$LOGS_DIR/${group_name}-${i}.log"
+            case "$op" in
+                1) echo -e "\n📜 日志：$cname"; tail -n 30 "$log_file" ;;
+                2) docker restart "$cname" && echo "🔁 已重启 $cname" ;;
+                3) docker stop "$cname" && echo "⛔ 已停止 $cname" ;;
+                *) break ;;
             esac
-        fi
-    done
-}
-
-# === 停止或重启所有容器 ===
-function manage_all_containers() {
-    echo "1. 停止所有容器"
-    echo "2. 重启所有容器"
-    read -rp "请选择操作: " action
-    local config=$(cat "$CONFIG_FILE")
-    local keys=$(echo "$config" | jq -r 'keys[] | select(test("^nexus-group-"))')
-    for key in $keys; do
-        local group_num=$(echo "$key" | cut -d- -f3)
-        local group_name="g$group_num"
-        local ids=($(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]'))
-        for i in "${!ids[@]}"; do
-            local idx=$((i + 1))
-            local cname="nexus-${group_name}-${idx}"
-            if [ "$action" == "1" ]; then
-                docker rm -f "$cname" &>/dev/null && echo "已停止 $cname"
-            elif [ "$action" == "2" ]; then
-                docker restart "$cname" &>/dev/null && echo "已重启 $cname"
-            fi
+            i=$((i + 1))
         done
     done
 }
 
-# === 主菜单 ===
+# === 停止 / 重启 所有容器 ===
+function manage_all_containers() {
+    echo "⚙️ 操作所有 nexus 容器"
+    echo "1. 停止全部"
+    echo "2. 重启全部"
+    read -rp "选择操作: " act
+    containers=$(docker ps -a --format '{{.Names}}' | grep '^nexus-g')
+    case "$act" in
+        1) for c in $containers; do docker stop "$c"; echo "⛔ 停止 $c"; done ;;
+        2) for c in $containers; do docker restart "$c"; echo "🔁 重启 $c"; done ;;
+        *) echo "❌ 无效选择" ;;
+    esac
+}
+
+# === 主菜单入口 ===
 function show_menu() {
     while true; do
         echo ""
@@ -247,58 +245,12 @@ function show_menu() {
             2) show_control_center ;;
             3) manage_all_containers ;;
             4) deploy_from_config_file ;;
-            5) echo "再见！" ; exit 0 ;;
-            *) echo "无效输入，请重新选择" ;;
+            5) echo "再见！"; exit 0 ;;
+            *) echo "❌ 无效选择" ;;
         esac
     done
 }
-# === 入口点 ===
+
+# === 主程序入口 ===
 init_environment
 show_menu
-# === 从配置文件部署未部署的组 ===
-function deploy_from_config_file() {
-    echo ""
-    echo "▶️ 扫描配置文件中未部署的组并启动..."
-
-    config=$(cat "$CONFIG_FILE")
-    groups=$(echo "$config" | jq -r 'keys[] | select(test("^nexus-group-"))' | sort)
-    missing_containers=0
-
-    ensure_dependencies
-    build_image
-
-    for key in $groups; do
-        group_num=$(echo "$key" | cut -d- -f3)
-        group_name="g$group_num"
-        proxy=$(echo "$config" | jq -r --arg k "$key" '.[$k].proxy_address')
-        ids=($(echo "$config" | jq -r --arg k "$key" '.[$k].id_pool[]'))
-
-        for i in "${!ids[@]}"; do
-            index=$((i + 1))
-            node_id="${ids[$i]}"
-            container_name="nexus-${group_name}-${index}"
-            log_file="$LOGS_DIR/${group_name}-${index}.log"
-
-            # 若容器尚不存在则部署
-            if ! docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
-                echo "🆕 启动容器 $container_name"
-                docker run -d \
-                    --name "$container_name" \
-                    -e NODE_ID="$node_id" \
-                    -e PROXY_ADDR="$proxy" \
-                    -e NEXUS_LOG="$log_file" \
-                    -v "$log_file":"$log_file" \
-                    "$IMAGE_NAME"
-                ((missing_containers++))
-            fi
-        done
-    done
-
-    if [ "$missing_containers" -eq 0 ]; then
-        echo "✅ 没有发现未部署的容器，一切就绪。"
-    else
-        echo "✅ 成功部署 $missing_containers 个新容器。"
-    fi
-}
-
-
